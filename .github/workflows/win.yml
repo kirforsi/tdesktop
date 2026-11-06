@@ -63,6 +63,31 @@ jobs:
           PY=python
           command -v $PY >/dev/null 2>&1 || PY=py
           $PY - <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          DropGram Desktop build-time patcher (runs inside the GitHub Actions patch step).
+
+          Patches tdesktop (kirforsi fork, v7.3.3) so the client talks to your own
+          server instead of Telegram's:
+
+            * Telegram/SourceFiles/mtproto/mtproto_dc_options.cpp
+                kBuiltInDcs / kBuiltInDcsTest          -> your IPv4 : port
+                kBuiltInDcsIPv6 / kBuiltInDcsIPv6Test  -> your IPv6 : port
+                kPublicRSAKeys / kTestPublicRSAKeys    -> your RSA public key
+
+            The key fingerprint is COMPUTED at runtime by tdesktop
+            (RSAPublicKey::Private::computeFingerprint - SHA1 of n+e, last 8 bytes),
+            so there is no hardcoded fingerprint to patch. As long as your server
+            sends the fingerprint matching your key in resPQ, the handshake resolves.
+
+            Plus a safety sweep of any leftover 149.154.*/91.108.*/95.161.76.100
+            addresses anywhere under Telegram/SourceFiles.
+
+          Line-ending safe: git checkout on Windows produces CRLF (core.autocrlf),
+          on Linux LF - the file's own ending is detected and preserved.
+
+          Idempotent: re-running on a patched tree converges to the same result.
+          """
           import os
           import re
           import sys
@@ -71,8 +96,8 @@ jobs:
           SERVER_IPV6 = os.environ.get("SERVER_IPV6", "fe80::91c9:ad67:3da3:4743")
           SERVER_PORT = os.environ.get("SERVER_PORT", "2398")
 
-          # Your server RSA public key (PKCS#1, without the PEM header/footer
-          # lines). If your key ever changes, edit these lines.
+          # Your server RSA public key (PKCS#1, without the PEM header/footer lines).
+          # If your key ever changes, edit these lines.
           RSA_KEY_BODY = [
               "MIIBCgKCAQEAwRBimRGOEEa2sy1/gWi6NghKeiDdORt18eoDHiKD1HvJqqkzSiOG",
               "+FvbI+fRFy7FbOhoUlZyYVXuJMCuAlse20sW9j6SMPudjJwghFosXBK9aB4FVtII",
@@ -90,26 +115,42 @@ jobs:
               sys.exit(1)
 
 
-          def key_block(varname):
-              lines = (["-----BEGIN RSA PUBLIC KEY-----"]
-                       + RSA_KEY_BODY
-                       + ["-----END RSA PUBLIC KEY-----"])
-              out = 'const char *%s[] = { "\\\n' % varname
-              for i, line in enumerate(lines):
-                  if i < len(lines) - 1:
-                      out += line + "\\n\\\n"
-                  else:
-                      out += line + '" };'
-              return out
-
-
           if not os.path.isfile(DC_PATH):
               fail("%s not found - run this from the repository root" % DC_PATH)
 
           with open(DC_PATH, "r", encoding="utf-8", newline="") as f:
               src = f.read()
 
-          # --- 1) built-in DC tables -> your server ----------------------
+          # git checks out text files as CRLF on Windows runners (core.autocrlf=true)
+          # and as LF on Linux. Detect this file's ending and preserve it everywhere.
+          EOL = "\r\n" if "\r\n" in src else "\n"
+          NL = r"\r?\n"  # in regexes: accept either line ending
+
+
+          def key_block(varname):
+              lines = (["-----BEGIN RSA PUBLIC KEY-----"]
+                       + RSA_KEY_BODY
+                       + ["-----END RSA PUBLIC KEY-----"])
+              out = 'const char *' + varname + '[] = { "\\' + EOL
+              for i, line in enumerate(lines):
+                  if i < len(lines) - 1:
+                      out += line + "\\n\\" + EOL
+                  else:
+                      out += line + '" };'
+              return out
+
+
+          def dc_table(name, ids, ip):
+              new = 'const BuiltInDc ' + name + '[] = {' + EOL
+              for dcid in ids:
+                  new += '\t{ %s, "%s" , %s },' % (dcid, ip, SERVER_PORT) + EOL
+              new += '};'
+              return new
+
+
+          # ===========================================================================
+          # 1) built-in DC tables -> your server
+          # ===========================================================================
           tables = {
               "kBuiltInDcs": ["1", "2", "3", "4", "5"],
               "kBuiltInDcsIPv6": ["1", "2", "3", "4", "5"],
@@ -121,18 +162,17 @@ jobs:
               pat = re.compile(r'const BuiltInDc ' + name + r'\[\] = \{.*?\};', re.DOTALL)
               if not pat.search(src):
                   fail("DC table %s[] not found in %s" % (name, DC_PATH))
-              new = 'const BuiltInDc %s[] = {\n' % name
-              for dcid in ids:
-                  new += '\t{ %s, "%s" , %s },\n' % (dcid, ip, SERVER_PORT)
-              new += '};'
-              src = pat.sub(lambda m: new, src, count=1)
+              src = pat.sub(lambda m: dc_table(name, ids, ip), src, count=1)
 
-          # --- 2) RSA public keys -> your key (prod + test tables) -------
+          # ===========================================================================
+          # 2) built-in RSA public keys -> your key (both production and test tables)
+          # ===========================================================================
           for varname in ("kTestPublicRSAKeys", "kPublicRSAKeys"):
               pat = re.compile(
-                  r'const char \*' + varname + r'\[\] = \{ "\\\n'
-                  r'(?:[^\n]*\\n\\\n)*'
-                  r'-----END RSA PUBLIC KEY-----" \};'
+                  r'const char \*' + varname + r'\[\] = \{ "\\'
+                  + NL
+                  + r'(?:[^\n]*\\n\\' + NL + r')*'
+                  + r'-----END RSA PUBLIC KEY-----" \};'
               )
               if not pat.search(src):
                   fail("RSA key table %s[] not found in %s" % (varname, DC_PATH))
@@ -141,7 +181,9 @@ jobs:
           with open(DC_PATH, "w", encoding="utf-8", newline="") as f:
               f.write(src)
 
-          # --- 3) safety sweep of leftover Telegram addresses -------------
+          # ===========================================================================
+          # 3) safety sweep: any leftover Telegram addresses in Telegram/SourceFiles
+          # ===========================================================================
           swept = 0
           for root, dirs, files in os.walk("Telegram/SourceFiles"):
               for fname in files:
@@ -164,7 +206,9 @@ jobs:
                       swept += 1
                       print("swept leftover Telegram IPs in %s" % fpath)
 
-          # --- 4) verify --------------------------------------------------
+          # ===========================================================================
+          # 4) verify
+          # ===========================================================================
           with open(DC_PATH, "r", encoding="utf-8", newline="") as f:
               final = f.read()
 
@@ -176,13 +220,24 @@ jobs:
           if final.count("-----BEGIN RSA PUBLIC KEY-----") != 2:
               fail("expected exactly 2 PEM key blocks in %s, found %d"
                    % (DC_PATH, final.count("-----BEGIN RSA PUBLIC KEY-----")))
+          for varname in ("kTestPublicRSAKeys", "kPublicRSAKeys"):
+              if ('const char *' + varname + '[]') not in final:
+                  fail("key table definition %s[] missing from %s" % (varname, DC_PATH))
+              if key_block(varname) not in final:
+                  fail("key table %s[] does not contain the expected generated block" % varname)
+          for name, ids in tables.items():
+              ip = SERVER_IPV6 if "IPv6" in name else SERVER_IPV4
+              if dc_table(name, ids, ip) not in final:
+                  fail("DC table %s[] does not contain the expected generated block" % name)
           if final.count('"' + SERVER_IPV4 + '"') < 5:
               fail("your server IP was not injected into the DC tables")
 
+          print("line ending detected   : %s"
+                % ("CRLF (Windows checkout)" if EOL == "\r\n" else "LF"))
           print("mtproto_dc_options.cpp : all DCs -> %s:%s (IPv6 %s declared)"
                 % (SERVER_IPV4, SERVER_PORT, SERVER_IPV6))
           print("RSA key tables         : kPublicRSAKeys + kTestPublicRSAKeys -> your key")
-          print("fingerprint            : computed at runtime (nothing to patch)")
+          print("fingerprint            : computed at runtime from the key (nothing to patch)")
           print("files swept            : %d" % swept)
           print("Native patches applied OK")
           PYEOF
